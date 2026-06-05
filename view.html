@@ -37,16 +37,34 @@
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws?role=view&session=${getSessionId()}`);
 
+    // Throttle: same (eventType + key) is ignored if within THROTTLE_MS
+    let lastKeyEvent = {};
+    const THROTTLE_MS = 200;
+
+    function isThrottled(eventType, key) {
+      const now = Date.now();
+      const keyed = lastKeyEvent[eventType + ':' + key];
+      if (keyed && (now - keyed) < THROTTLE_MS) {
+        return true;
+      }
+      lastKeyEvent[eventType + ':' + key] = now;
+      return false;
+    }
+
     ws.onmessage = (e) => {
       let data;
       try { data = JSON.parse(e.data); } catch { return; }
       if (data.type === 'key') {
+        const eventType = data.event === 'keydown' ? 'keydown' : 'keyup';
+
+        // Throttle check — skip duplicate within 200ms
+        if (isThrottled(eventType, data.key)) return;
+
         // Dispatch keyboard events into the iframe's contentWindow
         try {
           const win = iframe.contentWindow;
           const doc = iframe.contentDocument || win?.document;
           if (win && doc) {
-            const eventType = data.event === 'keydown' ? 'keydown' : 'keyup';
             const evtOpts = {
               key: data.key,
               code: mapKeyToCode(data.key),
@@ -55,17 +73,11 @@
             };
             const event = new KeyboardEvent(eventType, evtOpts);
 
-            // Dispatch to multiple targets for maximum compatibility
-            // 1. The active/focused element first
-            if (doc.activeElement && doc.activeElement !== doc.body) {
-              doc.activeElement.dispatchEvent(event);
-            }
-            // 2. The document
-            doc.dispatchEvent(event);
-            // 3. The window (some games/apps listen on window)
-            win.dispatchEvent(event);
-            // 4. The document body
-            if (doc.body) doc.body.dispatchEvent(event);
+            // Dispatch once on the focused element or document.
+            // Browser event bubbling will propagate to document/window naturally.
+            const target = (doc.activeElement && doc.activeElement !== doc.body)
+              ? doc.activeElement : doc;
+            target.dispatchEvent(event);
 
             console.log('[View] Dispatched ' + eventType + ' key=' + data.key);
           } else {
