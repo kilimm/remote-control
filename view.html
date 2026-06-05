@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>远程浏览 - 展示</title>
+<link rel="stylesheet" href="/public/style.css">
+</head>
+<body>
+<div id="view-container">
+  <div id="url-input-area">
+    <input type="url" id="url-input" placeholder="请输入要浏览的网址，如 http://111.228.50.95/ai-trends-2026">
+    <button id="url-go-btn">浏览</button>
+  </div>
+  <div id="iframe-wrapper" style="display:none">
+    <iframe id="content-frame"></iframe>
+  </div>
+</div>
+
+<script>
+(function() {
+  const urlInput = document.getElementById('url-input');
+  const goBtn = document.getElementById('url-go-btn');
+  const iframe = document.getElementById('content-frame');
+  const iframeWrapper = document.getElementById('iframe-wrapper');
+  const urlInputArea = document.getElementById('url-input-area');
+
+  // --- Session ID ---
+  function getSessionId() {
+    const params = new URLSearchParams(location.search);
+    return params.get('session') || 'default';
+  }
+
+  // --- WebSocket ---
+  let ws = null;
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws?role=view&session=${getSessionId()}`);
+
+    ws.onmessage = (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch { return; }
+      if (data.type === 'key') {
+        // Dispatch keyboard events into the iframe's contentWindow
+        try {
+          const win = iframe.contentWindow;
+          const doc = iframe.contentDocument || win?.document;
+          if (win && doc) {
+            const eventType = data.event === 'keydown' ? 'keydown' : 'keyup';
+            const evtOpts = {
+              key: data.key,
+              code: mapKeyToCode(data.key),
+              bubbles: true,
+              cancelable: true
+            };
+            const event = new KeyboardEvent(eventType, evtOpts);
+
+            // Dispatch to multiple targets for maximum compatibility
+            // 1. The active/focused element first
+            if (doc.activeElement && doc.activeElement !== doc.body) {
+              doc.activeElement.dispatchEvent(event);
+            }
+            // 2. The document
+            doc.dispatchEvent(event);
+            // 3. The window (some games/apps listen on window)
+            win.dispatchEvent(event);
+            // 4. The document body
+            if (doc.body) doc.body.dispatchEvent(event);
+
+            console.log('[View] Dispatched ' + eventType + ' key=' + data.key);
+          } else {
+            console.warn('[View] iframe not accessible');
+          }
+        } catch(e) {
+          console.warn('[View] dispatch error:', e);
+        }
+      }
+    };
+
+    ws.onclose = () => {
+      setTimeout(connectWs, 2000);
+    };
+  }
+
+  function mapKeyToCode(key) {
+    const map = {
+      'ArrowUp': 'ArrowUp',
+      'ArrowDown': 'ArrowDown',
+      'ArrowLeft': 'ArrowLeft',
+      'ArrowRight': 'ArrowRight',
+      ' ': 'Space'
+    };
+    return map[key] || key;
+  }
+
+  connectWs();
+
+  // --- Convert user URL to proxy URL ---
+  function toProxyUrl(rawUrl) {
+    let target = rawUrl.trim();
+    if (!/^https?:\/\//i.test(target)) {
+      target = 'http://' + target;
+    }
+    return '/proxy/' + target;
+  }
+
+  function toOriginalUrl(proxyUrl) {
+    if (proxyUrl.startsWith('/proxy/')) {
+      return proxyUrl.slice(7);
+    }
+    return proxyUrl;
+  }
+
+  // --- URL from path params ---
+  function getUrlFromPath() {
+    const params = new URLSearchParams(location.search);
+    return params.get('url') || '';
+  }
+
+  function loadUrl(rawUrl) {
+    if (!rawUrl) return;
+    const proxyUrl = toProxyUrl(rawUrl);
+    iframe.src = proxyUrl;
+    iframeWrapper.style.display = 'block';
+    urlInputArea.style.display = 'none';
+
+    // Sync original URL to browser params
+    const session = getSessionId();
+    const originalUrl = toOriginalUrl(proxyUrl);
+    const newPath = `/view?url=${encodeURIComponent(originalUrl)}${session !== 'default' ? '&session=' + session : ''}`;
+    window.history.replaceState(null, '', newPath);
+  }
+
+  const initialUrl = getUrlFromPath();
+  if (initialUrl) {
+    loadUrl(initialUrl);
+  }
+
+  goBtn.addEventListener('click', () => {
+    loadUrl(urlInput.value);
+  });
+
+  urlInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') loadUrl(urlInput.value);
+  });
+
+  // Detect iframe navigation (same-origin via proxy, so we can read location)
+  let lastKnownUrl = '';
+  function pollIframeUrl() {
+    try {
+      if (!iframe.contentWindow) return;
+      const currentUrl = iframe.contentWindow.location.href;
+      if (currentUrl && currentUrl !== lastKnownUrl && currentUrl !== 'about:blank') {
+        lastKnownUrl = currentUrl;
+
+        // Convert proxy URL back to original URL for the address bar
+        const originalUrl = toOriginalUrl(currentUrl);
+        const session = getSessionId();
+        const newPath = `/view?url=${encodeURIComponent(originalUrl)}${session !== 'default' ? '&session=' + session : ''}`;
+        window.history.replaceState(null, '', newPath);
+
+        // Notify control page
+        if (ws && ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: 'nav', url: originalUrl }));
+        }
+      }
+    } catch(e) {
+      // Might fail briefly during navigation
+    }
+  }
+
+  setInterval(pollIframeUrl, 500);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>远程浏览 - 控制</title>
+<link rel="stylesheet" href="/public/style.css">
+</head>
+<body>
+<div id="control-container">
+  <!-- Password screen -->
+  <div id="password-screen">
+    <h2>控制面板</h2>
+    <p class="hint">请输入访问密码</p>
+    <input type="password" id="password-input" placeholder="密码" maxlength="20">
+    <button id="password-btn">解锁</button>
+    <p id="password-error" class="error" style="display:none">密码错误</p>
+  </div>
+
+  <!-- Control panel -->
+  <div id="control-panel" style="display:none">
+    <div id="status-bar">
+      <span id="status-text">⏳ 等待连接...</span>
+      <span id="url-display" class="url-display"></span>
+    </div>
+
+    <div id="keyboard">
+      <div class="keyboard-row top">
+        <button class="key" data-key="ArrowUp">↑</button>
+      </div>
+      <div class="keyboard-row middle">
+        <button class="key" data-key="ArrowLeft">←</button>
+        <button class="key space-key" data-key=" ">␣ 空格</button>
+        <button class="key" data-key="ArrowRight">→</button>
+      </div>
+      <div class="keyboard-row bottom">
+        <button class="key" data-key="ArrowDown">↓</button>
+      </div>
+    </div>
+
+    <div id="password-change-area">
+      <button id="change-pw-btn">修改密码</button>
+    </div>
+    <div id="password-change-form" style="display:none">
+      <input type="password" id="old-pw" placeholder="旧密码">
+      <input type="password" id="new-pw" placeholder="新密码">
+      <button id="change-pw-submit">确认修改</button>
+      <span id="change-pw-msg"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  // --- Password ---
+  let currentPassword = '12345679';
+
+  // --- Session ID ---
+  function getSessionId() {
+    const params = new URLSearchParams(location.search);
+    return params.get('session') || 'default';
+  }
+
+  // --- WebSocket ---
+  let ws = null;
+  let connected = false;
+
+  function connectWs() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws?role=control&session=${getSessionId()}`);
+
+    ws.onopen = () => {
+      connected = true;
+      document.getElementById('status-text').textContent = '✅ 已连接';
+    };
+
+    ws.onmessage = (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch { return; }
+      if (data.type === 'nav' && data.url) {
+        document.getElementById('url-display').textContent = data.url;
+      }
+    };
+
+    ws.onclose = () => {
+      connected = false;
+      document.getElementById('status-text').textContent = '❌ 已断开';
+      setTimeout(connectWs, 2000);
+    };
+
+    ws.onerror = () => {
+      document.getElementById('status-text').textContent = '❌ 连接错误';
+    };
+  }
+
+  function sendKey(key, eventType) {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'key', key, event: eventType }));
+    }
+  }
+
+  // --- Password ---
+  const passwordInput = document.getElementById('password-input');
+  const passwordBtn = document.getElementById('password-btn');
+  const passwordError = document.getElementById('password-error');
+  const passwordScreen = document.getElementById('password-screen');
+  const controlPanel = document.getElementById('control-panel');
+
+  passwordBtn.addEventListener('click', () => {
+    if (passwordInput.value === currentPassword) {
+      passwordScreen.style.display = 'none';
+      controlPanel.style.display = 'block';
+      connectWs();
+    } else {
+      passwordError.style.display = 'block';
+      setTimeout(() => { passwordError.style.display = 'none'; }, 2000);
+    }
+  });
+
+  passwordInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') passwordBtn.click();
+  });
+
+  // --- Keyboard events ---
+  // Click / touch on virtual keys
+  document.querySelectorAll('.key').forEach(btn => {
+    const key = btn.dataset.key;
+
+    const press = (e) => {
+      e.preventDefault();
+      sendKey(key, 'keydown');
+      btn.classList.add('active');
+    };
+
+    const release = (e) => {
+      e.preventDefault();
+      sendKey(key, 'keyup');
+      btn.classList.remove('active');
+    };
+
+    btn.addEventListener('mousedown', press);
+    btn.addEventListener('mouseup', release);
+    btn.addEventListener('mouseleave', release);
+    btn.addEventListener('touchstart', press, { passive: false });
+    btn.addEventListener('touchend', release, { passive: false });
+    btn.addEventListener('touchcancel', release, { passive: false });
+  });
+
+  // Physical keyboard passthrough (for testing)
+  document.addEventListener('keydown', (e) => {
+    const valid = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '];
+    if (valid.includes(e.key)) {
+      e.preventDefault();
+      sendKey(e.key, 'keydown');
+    }
+  });
+
+  document.addEventListener('keyup', (e) => {
+    const valid = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '];
+    if (valid.includes(e.key)) {
+      e.preventDefault();
+      sendKey(e.key, 'keyup');
+    }
+  });
+
+  // --- Password change ---
+  const changePwBtn = document.getElementById('change-pw-btn');
+  const changePwForm = document.getElementById('password-change-form');
+  const oldPwInput = document.getElementById('old-pw');
+  const newPwInput = document.getElementById('new-pw');
+  const changePwSubmit = document.getElementById('change-pw-submit');
+  const changePwMsg = document.getElementById('change-pw-msg');
+
+  changePwBtn.addEventListener('click', () => {
+    changePwForm.style.display = changePwForm.style.display === 'none' ? 'block' : 'none';
+    changePwMsg.textContent = '';
+  });
+
+  changePwSubmit.addEventListener('click', () => {
+    if (oldPwInput.value !== currentPassword) {
+      changePwMsg.textContent = '❌ 旧密码错误';
+      changePwMsg.style.color = 'red';
+      return;
+    }
+    if (newPwInput.value.length < 4) {
+      changePwMsg.textContent = '❌ 新密码至少4位';
+      changePwMsg.style.color = 'red';
+      return;
+    }
+    currentPassword = newPwInput.value;
+    oldPwInput.value = '';
+    newPwInput.value = '';
+    changePwMsg.textContent = '✅ 密码已修改';
+    changePwMsg.style.color = 'green';
+    setTimeout(() => { changePwMsg.textContent = ''; }, 3000);
+  });
+})();
+</script>
+</body>
+</html>
