@@ -3,185 +3,627 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>远程浏览 - 展示</title>
+<title>远程展示</title>
 <link rel="stylesheet" href="/public/style.css">
+<link rel="stylesheet" href="/public/pptx-viewer.css">
 </head>
 <body>
-<div id="view-container">
-  <div id="url-input-area">
-    <input type="url" id="url-input" placeholder="请输入要浏览的网址，如 http://111.228.50.95/ai-trends-2026">
-    <button id="url-go-btn">浏览</button>
+<div id="pptx-view-container">
+  <!-- 顶部栏 -->
+  <div id="top-bar">
+    <span class="title" id="top-bar-title">远程展示</span>
+    <div class="actions">
+      <button id="back-btn">← 返回</button>
+      <button id="fullscreen-btn">⛶ 全屏</button>
+    </div>
   </div>
+
+  <!-- 输入区域 -->
+  <div id="load-area">
+    <h1>📺 远程展示</h1>
+    <p class="subtitle">输入链接或上传文件，控制端可远程操作</p>
+
+    <!-- 统一 URL 输入框 -->
+    <div class="load-method" style="width:100%;max-width:640px;margin-bottom:24px;">
+      <span class="method-label">🔗 输入链接（网页 / PPT）</span>
+      <div class="url-input-group" style="flex-direction:row;">
+        <input type="text" id="url-input" placeholder="网页或 PPT 文件链接，如 https://example.com/demo.pptx" style="flex:1;">
+        <button id="url-load-btn">加载</button>
+      </div>
+    </div>
+
+    <div style="color:#444;font-size:12px;margin-bottom:20px;">—— 或者 ——</div>
+
+    <!-- 文件上传 -->
+    <div class="load-method" style="width:100%;max-width:640px;">
+      <span class="method-label">📁 上传文件</span>
+      <div class="upload-zone" id="upload-zone">
+        <div class="icon">📄</div>
+        <div class="text">点击选择或拖拽文件</div>
+        <div class="sub-text">支持 .pptx 格式</div>
+        <input type="file" id="file-input" accept=".pptx,.ppt" style="display:none">
+      </div>
+    </div>
+
+    <!-- 加载状态 -->
+    <div id="load-status" style="display:none;text-align:center">
+      <p id="load-status-text">⏳ 正在加载...</p>
+      <div id="load-progress" style="margin-top:8px;font-size:12px;color:#666">0%</div>
+    </div>
+  </div>
+
+  <!-- 幻灯片容器（PPT 模式） -->
+  <div id="slide-container">
+    <div id="slide-wrapper">
+      <div id="slide-content"></div>
+      <div class="nav-overlay prev" id="nav-prev"><span class="arrow">‹</span></div>
+      <div class="nav-overlay next" id="nav-next"><span class="arrow">›</span></div>
+    </div>
+  </div>
+
+  <!-- iframe 包裹器（网页模式） -->
   <div id="iframe-wrapper" style="display:none">
     <iframe id="content-frame"></iframe>
   </div>
+
+  <!-- 底部页码（仅 PPT 模式） -->
+  <div id="slide-info" class="hidden"><span id="slide-page-num">1 / 1</span></div>
 </div>
 
+<script src="/public/pptx-preview.umd.js"></script>
 <script>
 (function() {
-  const urlInput = document.getElementById('url-input');
-  const goBtn = document.getElementById('url-go-btn');
-  const iframe = document.getElementById('content-frame');
-  const iframeWrapper = document.getElementById('iframe-wrapper');
-  const urlInputArea = document.getElementById('url-input-area');
+  'use strict';
 
-  // --- Session ID ---
+  const WS_THROTTLE_MS = 200;
+
+  /* ============================================================
+     DOM 引用
+     ============================================================ */
+  const topBar = document.getElementById('top-bar');
+  const topBarTitle = document.getElementById('top-bar-title');
+  const backBtn = document.getElementById('back-btn');
+  const fullscreenBtn = document.getElementById('fullscreen-btn');
+  const loadArea = document.getElementById('load-area');
+  const uploadZone = document.getElementById('upload-zone');
+  const fileInput = document.getElementById('file-input');
+  const urlInput = document.getElementById('url-input');
+  const urlLoadBtn = document.getElementById('url-load-btn');
+  const loadStatus = document.getElementById('load-status');
+  const loadStatusText = document.getElementById('load-status-text');
+  const loadProgress = document.getElementById('load-progress');
+  const slideContainer = document.getElementById('slide-container');
+  const slideWrapper = document.getElementById('slide-wrapper');
+  const slideContent = document.getElementById('slide-content');
+  const slideInfo = document.getElementById('slide-info');
+  const slidePageNum = document.getElementById('slide-page-num');
+  const navPrev = document.getElementById('nav-prev');
+  const navNext = document.getElementById('nav-next');
+  const iframeWrapper = document.getElementById('iframe-wrapper');
+  const contentFrame = document.getElementById('content-frame');
+
+  /* ============================================================
+     状态
+     ============================================================ */
+  let mode = null;          // 'ppt' | 'browse'
+  let pptxPreviewer = null;
+  let currentSlide = 0;
+  let totalSlides = 0;
+  let isFullscreen = false;
+  let lastKnownUrl = '';
+
+  /* ============================================================
+     Session 参数
+     ============================================================ */
   function getSessionId() {
-    const params = new URLSearchParams(location.search);
-    return params.get('session') || 'default';
+    return new URLSearchParams(location.search).get('session') || 'default';
   }
 
-  // --- WebSocket ---
+  function getUrlParam() {
+    return new URLSearchParams(location.search).get('url') || '';
+  }
+
+  /* ============================================================
+     WebSocket
+     ============================================================ */
   let ws = null;
+  let lastKeyEvent = {};
+
+  function isThrottled(eventType, key) {
+    const now = Date.now();
+    const k = eventType + ':' + key;
+    if (lastKeyEvent[k] && (now - lastKeyEvent[k]) < WS_THROTTLE_MS) return true;
+    lastKeyEvent[k] = now;
+    return false;
+  }
+
+  function mapKeyToCode(key) {
+    return { ArrowUp:'ArrowUp', ArrowDown:'ArrowDown', ArrowLeft:'ArrowLeft', ArrowRight:'ArrowRight', ' ':'Space' }[key] || key;
+  }
+
   function connectWs() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws?role=view&session=${getSessionId()}`);
 
-    // Throttle: same (eventType + key) is ignored if within THROTTLE_MS
-    let lastKeyEvent = {};
-    const THROTTLE_MS = 200;
-
-    function isThrottled(eventType, key) {
-      const now = Date.now();
-      const keyed = lastKeyEvent[eventType + ':' + key];
-      if (keyed && (now - keyed) < THROTTLE_MS) {
-        return true;
-      }
-      lastKeyEvent[eventType + ':' + key] = now;
-      return false;
-    }
-
     ws.onmessage = (e) => {
       let data;
       try { data = JSON.parse(e.data); } catch { return; }
-      if (data.type === 'key') {
-        const eventType = data.event === 'keydown' ? 'keydown' : 'keyup';
 
-        // Throttle check — skip duplicate within 200ms
-        if (isThrottled(eventType, data.key)) return;
+      if (data.type !== 'key') return;
+      if (data.event !== 'keydown') return;  // 只处理 keydown，忽略 keyup 避免双击
+      if (isThrottled(data.event, data.key)) return;
 
-        // Dispatch keyboard events into the iframe's contentWindow
+      if (mode === 'ppt') {
+        // PPT 模式：空格/右 → 下一页，左 → 上一页
+        if (data.key === 'ArrowLeft') {
+          prevSlide();
+        } else if (data.key === 'ArrowRight' || data.key === ' ') {
+          nextSlide();
+        }
+      } else if (mode === 'browse') {
+        // 网页模式：透传键盘事件到 iframe
         try {
-          const win = iframe.contentWindow;
-          const doc = iframe.contentDocument || win?.document;
+          const win = contentFrame.contentWindow;
+          const doc = contentFrame.contentDocument || (win && win.document);
           if (win && doc) {
-            const evtOpts = {
+            const eventType = data.event === 'keydown' ? 'keydown' : 'keyup';
+            const event = new KeyboardEvent(eventType, {
               key: data.key,
               code: mapKeyToCode(data.key),
               bubbles: true,
               cancelable: true
-            };
-            const event = new KeyboardEvent(eventType, evtOpts);
-
-            // Dispatch once on the focused element or document.
-            // Browser event bubbling will propagate to document/window naturally.
-            const target = (doc.activeElement && doc.activeElement !== doc.body)
-              ? doc.activeElement : doc;
+            });
+            const target = (doc.activeElement && doc.activeElement !== doc.body) ? doc.activeElement : doc;
             target.dispatchEvent(event);
-
-            console.log('[View] Dispatched ' + eventType + ' key=' + data.key);
-          } else {
-            console.warn('[View] iframe not accessible');
           }
         } catch(e) {
-          console.warn('[View] dispatch error:', e);
+          console.warn('[Browse] dispatch error:', e);
         }
       }
     };
 
-    ws.onclose = () => {
-      setTimeout(connectWs, 2000);
-    };
+    ws.onclose = () => setTimeout(connectWs, 2000);
   }
 
-  function mapKeyToCode(key) {
-    const map = {
-      'ArrowUp': 'ArrowUp',
-      'ArrowDown': 'ArrowDown',
-      'ArrowLeft': 'ArrowLeft',
-      'ArrowRight': 'ArrowRight',
-      ' ': 'Space'
-    };
-    return map[key] || key;
+  /* ============================================================
+     工具
+     ============================================================ */
+  function isPptUrl(url) {
+    return /\.pptx?(\?|#|$)/i.test(url);
   }
 
-  connectWs();
-
-  // --- Convert user URL to proxy URL ---
-  function toProxyUrl(rawUrl) {
-    let target = rawUrl.trim();
-    if (!/^https?:\/\//i.test(target)) {
-      target = 'http://' + target;
-    }
-    return '/proxy/' + target;
+  function toProxyUrl(raw) {
+    let t = raw.trim();
+    if (!/^https?:\/\//i.test(t)) t = 'http://' + t;
+    return '/proxy/' + t;
   }
 
   function toOriginalUrl(proxyUrl) {
-    if (proxyUrl.startsWith('/proxy/')) {
-      return proxyUrl.slice(7);
-    }
-    return proxyUrl;
+    return proxyUrl.startsWith('/proxy/') ? proxyUrl.slice(7) : proxyUrl;
   }
 
-  // --- URL from path params ---
-  function getUrlFromPath() {
-    const params = new URLSearchParams(location.search);
-    return params.get('url') || '';
+  function escapeHtml(text) {
+    const d = document.createElement('div');
+    d.textContent = text;
+    return d.innerHTML;
   }
 
-  function loadUrl(rawUrl) {
-    if (!rawUrl) return;
-    const proxyUrl = toProxyUrl(rawUrl);
-    iframe.src = proxyUrl;
-    iframeWrapper.style.display = 'block';
-    urlInputArea.style.display = 'none';
-
-    // Sync original URL to browser params
+  function updateUrlBar(url) {
     const session = getSessionId();
-    const originalUrl = toOriginalUrl(proxyUrl);
-    const newPath = `/view?url=${encodeURIComponent(originalUrl)}${session !== 'default' ? '&session=' + session : ''}`;
-    window.history.replaceState(null, '', newPath);
+    const p = `/view?url=${encodeURIComponent(url)}${session !== 'default' ? '&session=' + session : ''}`;
+    window.history.replaceState(null, '', p);
   }
 
-  const initialUrl = getUrlFromPath();
-  if (initialUrl) {
-    loadUrl(initialUrl);
+  /* ============================================================
+     模式切换
+     ============================================================ */
+  function enterPptMode() {
+    mode = 'ppt';
+    loadArea.style.display = 'none';
+    iframeWrapper.style.display = 'none';
+    slideContainer.classList.add('active');
+    slideInfo.classList.remove('hidden');
+    if (window.__pptSlides) {
+      renderFallbackSlide(0);
+    }
+    updatePageInfo();
   }
 
-  goBtn.addEventListener('click', () => {
-    loadUrl(urlInput.value);
-  });
+  function enterBrowseMode(rawUrl) {
+    mode = 'browse';
+    loadArea.style.display = 'none';
+    slideContainer.classList.remove('active');
+    slideInfo.classList.add('hidden');
+    iframeWrapper.style.display = 'block';
+    contentFrame.src = toProxyUrl(rawUrl);
+    updateUrlBar(rawUrl);
 
-  urlInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') loadUrl(urlInput.value);
-  });
+    // 通知控制端导航变化
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type: 'nav', url: rawUrl }));
+    }
+  }
 
-  // Detect iframe navigation (same-origin via proxy, so we can read location)
-  let lastKnownUrl = '';
-  function pollIframeUrl() {
+  function exitAll() {
+    mode = null;
+    slideContainer.classList.remove('active');
+    slideInfo.classList.add('hidden');
+    iframeWrapper.style.display = 'none';
+    loadArea.style.display = 'flex';
+    loadStatus.style.display = 'none';
+    topBarTitle.textContent = '远程展示';
+
+    if (pptxPreviewer && pptxPreviewer.destroy) {
+      // Clear wrapper content manually first to avoid stale DOM
+      slideContent.innerHTML = '';
+      pptxPreviewer.destroy();
+    }
+    pptxPreviewer = null;
+    window.__pptSlides = null;
+    window.__pptBuffer = null;
+    currentSlide = 0;
+    totalSlides = 0;
+    slideContent.innerHTML = '';
+    contentFrame.src = '';
+  }
+
+  // 全屏
+  function exitFullscreen() {
+    if (document.fullscreenElement) document.exitFullscreen();
+    isFullscreen = false;
+    topBar.style.display = 'flex';
+    slideInfo.classList.remove('hidden');
+    fullscreenBtn.textContent = '⛶ 全屏';
+  }
+
+  function requestFullscreen() {
+    const el = document.getElementById('pptx-view-container');
+    if (el.requestFullscreen) el.requestFullscreen();
+    isFullscreen = true;
+    topBar.style.display = 'none';
+    slideInfo.classList.add('hidden');
+  }
+
+  /* ============================================================
+     UI 辅助
+     ============================================================ */
+  function showLoading(text) {
+    loadStatusText.textContent = text || '⏳ 正在加载...';
+    loadArea.style.display = 'none';
+    loadStatus.style.display = 'block';
+  }
+
+  function hideLoading() { loadStatus.style.display = 'none'; }
+
+  function showError(msg) {
+    loadStatusText.textContent = '❌ ' + msg;
+    loadStatus.style.display = 'block';
+    loadProgress.textContent = '';
+    setTimeout(() => { loadStatus.style.display = 'none'; loadArea.style.display = 'flex'; }, 4000);
+  }
+
+  /* ============================================================
+     PPT 加载与翻页
+     ============================================================ */
+
+  // 加载 PPT
+  function loadPpt(buffer, fileName) {
+    showLoading('正在解析 PPT...');
+    topBarTitle.textContent = fileName || 'PPT 展示';
+
+    if (typeof pptxPreview !== 'undefined' && pptxPreview.init) {
+      // 先进入PPT模式，让容器有实际渲染尺寸
+      // 此时 load-area 隐藏，slide-container 显示并获得尺寸
+      mode = 'ppt';
+      loadArea.style.display = 'none';
+      iframeWrapper.style.display = 'none';
+      slideContainer.classList.add('active');
+      // 触发重排确保布局完成
+      void slideContainer.offsetWidth;
+
+      // 获取容器实际尺寸
+      var cw = slideContent.clientWidth || slideContent.offsetWidth || window.innerWidth;
+      var ch = slideContent.clientHeight || slideContent.offsetHeight || window.innerHeight;
+
+      pptxPreviewer = pptxPreview.init(slideContent, {
+        width: cw,
+        height: ch,
+        mode: 'slide'
+      });
+
+      // 保存 buffer 供 resize 重建使用
+      window.__pptBuffer = buffer;
+      pptxPreviewer.load(buffer).then((pptxObj) => {
+        totalSlides = pptxPreviewer.slideCount || (pptxObj && pptxObj.slides ? pptxObj.slides.length : 0);
+        currentSlide = 0;
+        // 渲染第一页（用 renderSingleSlide 替代库自带的翻页按钮）
+        pptxPreviewer.renderSingleSlide(0);
+        // 显示页面信息
+        slideInfo.classList.remove('hidden');
+        updatePageInfo();
+        hideLoading();
+      }).catch((err) => {
+        console.warn('pptx-preview load failed, using fallback:', err);
+        if (pptxPreviewer && pptxPreviewer.destroy) {
+          slideContent.innerHTML = '';
+          pptxPreviewer.destroy();
+        }
+        pptxPreviewer = null;
+        // 清理状态
+        exitAll();
+        fallbackLoadPpt(buffer);
+      });
+    } else {
+      fallbackLoadPpt(buffer);
+    }
+  }
+
+  // fallback 解析
+  async function fallbackLoadPpt(buffer) {
     try {
-      if (!iframe.contentWindow) return;
-      const currentUrl = iframe.contentWindow.location.href;
+      showLoading('正在解析 PPT (备用模式)...');
+      const JSZip = window.JSZip;
+      if (!JSZip) { showError('PPT 解析库未加载'); return; }
+
+      const zip = await JSZip.loadAsync(buffer);
+      const slideFiles = [];
+      zip.forEach((path, file) => {
+        const m = path.match(/^ppt\/slides\/slide(\d+)\.xml$/);
+        if (m) slideFiles.push({ index: parseInt(m[1]), path, file });
+      });
+      slideFiles.sort((a, b) => a.index - b.index);
+      if (!slideFiles.length) { showError('未找到幻灯片内容'); return; }
+
+      totalSlides = slideFiles.length;
+      currentSlide = 0;
+      window.__pptSlides = [];
+
+      for (const sf of slideFiles) {
+        const xml = await sf.file.async('string');
+        const doc = new DOMParser().parseFromString(xml, 'text/xml');
+        const texts = [];
+        doc.querySelectorAll('a\\:t, t').forEach(el => {
+          const t = el.textContent.trim();
+          if (t) texts.push(t);
+        });
+        window.__pptSlides.push({ index: sf.index, texts, xml: doc });
+      }
+
+      enterPptMode();
+      hideLoading();
+      renderFallbackSlide(0);
+    } catch (err) {
+      showError('PPT 解析失败: ' + err.message);
+    }
+  }
+
+  function renderFallbackSlide(index) {
+    if (!window.__pptSlides || !window.__pptSlides[index]) return;
+    const texts = window.__pptSlides[index].texts || [];
+    let html = '<div style="width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;background:white;color:#333;font-family:Arial,sans-serif;">';
+    let title = texts.length && texts[0].length < 100 ? texts[0] : '';
+    let body = title ? texts.slice(1) : texts;
+    if (title) html += `<h1 style="font-size:36px;margin-bottom:24px;color:#222;">${escapeHtml(title)}</h1>`;
+    body.forEach(t => html += `<p style="font-size:20px;margin:8px 0;color:#555;">${escapeHtml(t)}</p>`);
+    if (!texts.length) html += '<p style="font-size:18px;color:#999;">(空白页)</p>';
+    html += `<div style="position:absolute;bottom:16px;right:24px;font-size:14px;color:#ccc;">${index + 1}</div></div>`;
+    slideContent.innerHTML = html;
+    updatePageInfo();
+  }
+
+  function nextSlide() {
+    if (mode !== 'ppt' || currentSlide >= totalSlides - 1) return;
+    currentSlide++;
+    if (window.__pptSlides) { renderFallbackSlide(currentSlide); }
+    else if (pptxPreviewer && pptxPreviewer.renderSingleSlide) { pptxPreviewer.renderSingleSlide(currentSlide); }
+    updatePageInfo();
+  }
+
+  function prevSlide() {
+    if (mode !== 'ppt' || currentSlide <= 0) return;
+    currentSlide--;
+    if (window.__pptSlides) { renderFallbackSlide(currentSlide); }
+    else if (pptxPreviewer && pptxPreviewer.renderSingleSlide) { pptxPreviewer.renderSingleSlide(currentSlide); }
+    updatePageInfo();
+  }
+
+  function updatePageInfo() {
+    slidePageNum.textContent = `${currentSlide + 1} / ${totalSlides}`;
+  }
+
+  /* ============================================================
+     文件处理（本地上传 PPT）
+     ============================================================ */
+  uploadZone.addEventListener('click', () => fileInput.click());
+
+  uploadZone.addEventListener('dragover', (e) => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+  uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+  uploadZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    uploadZone.classList.remove('drag-over');
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) handleFile(fileInput.files[0]);
+  });
+
+  function handleFile(file) {
+    if (!file.name.match(/\.pptx?$/i)) { showError('请选择 .pptx 格式文件'); return; }
+    const reader = new FileReader();
+    reader.onprogress = (e) => { if (e.lengthComputable) loadProgress.textContent = Math.round(e.loaded / e.total * 100) + '%'; };
+    reader.onload = (e) => loadPpt(e.target.result, file.name);
+    reader.onerror = () => showError('文件读取失败');
+    reader.readAsArrayBuffer(file);
+  }
+
+  /* ============================================================
+     URL 输入（自动判断网页 / PPT）
+     ============================================================ */
+  function handleUrlInput(raw) {
+    let url = raw.trim();
+    if (!url) return;
+    if (!/^https?:\/\//i.test(url)) url = 'http://' + url;
+
+    if (isPptUrl(url)) {
+      loadPptFromUrl(url);
+    } else {
+      enterBrowseMode(url);
+    }
+  }
+
+  urlLoadBtn.addEventListener('click', () => handleUrlInput(urlInput.value));
+  urlInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleUrlInput(urlInput.value); });
+
+  async function loadPptFromUrl(url) {
+    showLoading('正在下载 PPT...');
+    try {
+      const resp = await fetch(toProxyUrl(url));
+      if (!resp.ok) throw new Error('下载失败: ' + resp.status);
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        loadProgress.textContent = Math.round(received / 1024) + ' KB';
+      }
+      const buffer = await new Blob(chunks).arrayBuffer();
+      let urlPath;
+      try { urlPath = new URL(url).pathname; } catch(e) { urlPath = '/presentation.pptx'; }
+      const fileName = urlPath.split('/').pop() || 'presentation.pptx';
+      updateUrlBar(url);
+      loadPpt(buffer, fileName);
+    } catch (err) {
+      showError('下载失败: ' + err.message);
+    }
+  }
+
+  /* ============================================================
+     iframe 导航检测（网页模式）
+     ============================================================ */
+  function pollIframeUrl() {
+    if (mode !== 'browse') return;
+    try {
+      if (!contentFrame.contentWindow) return;
+      const currentUrl = contentFrame.contentWindow.location.href;
       if (currentUrl && currentUrl !== lastKnownUrl && currentUrl !== 'about:blank') {
         lastKnownUrl = currentUrl;
-
-        // Convert proxy URL back to original URL for the address bar
         const originalUrl = toOriginalUrl(currentUrl);
-        const session = getSessionId();
-        const newPath = `/view?url=${encodeURIComponent(originalUrl)}${session !== 'default' ? '&session=' + session : ''}`;
-        window.history.replaceState(null, '', newPath);
-
-        // Notify control page
+        updateUrlBar(originalUrl);
         if (ws && ws.readyState === 1) {
           ws.send(JSON.stringify({ type: 'nav', url: originalUrl }));
         }
       }
-    } catch(e) {
-      // Might fail briefly during navigation
+    } catch(e) {}
+  }
+
+  /* ============================================================
+     事件绑定
+     ============================================================ */
+  backBtn.addEventListener('click', exitAll);
+
+  fullscreenBtn.addEventListener('click', () => {
+    isFullscreen ? exitFullscreen() : requestFullscreen();
+  });
+
+  // 本地键盘（PPT 模式）
+  document.addEventListener('keydown', (e) => {
+    if (mode === 'ppt') {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); prevSlide(); }
+      else if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); nextSlide(); }
+      else if (e.key === 'Escape' && isFullscreen) exitFullscreen();
+    }
+  });
+
+  // PPT 模式点击导航
+  navPrev.addEventListener('click', prevSlide);
+  navNext.addEventListener('click', nextSlide);
+
+  // PPT 模式滚轮
+  slideWrapper.addEventListener('wheel', (e) => {
+    if (mode !== 'ppt') return;
+    e.preventDefault();
+    if (e.deltaY > 0 || e.deltaX > 0) nextSlide(); else prevSlide();
+  }, { passive: false });
+
+  // PPT 模式触屏
+  let touchStartX = 0;
+  slideWrapper.addEventListener('touchstart', (e) => { touchStartX = e.changedTouches[0].screenX; }, { passive: true });
+  slideWrapper.addEventListener('touchend', (e) => {
+    if (mode !== 'ppt') return;
+    const diff = e.changedTouches[0].screenX - touchStartX;
+    if (Math.abs(diff) > 50) diff < 0 ? nextSlide() : prevSlide();
+  }, { passive: true });
+
+  // iframe 导航轮询
+  setInterval(pollIframeUrl, 500);
+
+  // 窗口自适应（PPT 模式）
+  window.addEventListener('resize', () => {
+    if (mode !== 'ppt' || !pptxPreviewer || !window.__pptBuffer) return;
+    // 保存当前页码，重新初始化 previewer
+    try {
+      var idx = currentSlide;
+      var buf = window.__pptBuffer;
+      if (pptxPreviewer && pptxPreviewer.destroy) {
+        slideContent.innerHTML = '';
+        pptxPreviewer.destroy();
+      }
+      pptxPreviewer = null;
+      var cw = slideContent.clientWidth || window.innerWidth;
+      var ch = slideContent.clientHeight || window.innerHeight;
+      pptxPreviewer = pptxPreview.init(slideContent, {
+        width: cw,
+        height: ch,
+        mode: 'slide'
+      });
+      pptxPreviewer.load(buf).then(() => {
+        pptxPreviewer.renderSingleSlide(idx);
+      }).catch(function() {});
+    } catch(e) { /* ignore */ }
+  });
+
+  // 全屏切换
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && isFullscreen) {
+      isFullscreen = false;
+      topBar.style.display = 'flex';
+      slideInfo.classList.remove('hidden');
+      fullscreenBtn.textContent = '⛶ 全屏';
+    }
+    if (mode === 'ppt') {
+      setTimeout(() => window.dispatchEvent(new Event('resize')), 100);
+    }
+  });
+
+  /* ============================================================
+     初始化
+     ============================================================ */
+  function loadJSZip() {
+    return new Promise((resolve) => {
+      if (window.JSZip) { resolve(); return; }
+      const s = document.createElement('script');
+      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+      s.onload = resolve;
+      s.onerror = () => { console.warn('JSZip CDN failed'); resolve(); };
+      document.head.appendChild(s);
+    });
+  }
+
+  async function init() {
+    await loadJSZip();
+    connectWs();
+    const urlParam = getUrlParam();
+    if (urlParam) {
+      urlInput.value = urlParam;
+      handleUrlInput(urlParam);
     }
   }
 
-  setInterval(pollIframeUrl, 500);
+  init();
 })();
 </script>
 </body>

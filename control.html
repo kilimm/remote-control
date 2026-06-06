@@ -3,28 +3,36 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>远程浏览 - 控制</title>
+<title>PPT 远程控制</title>
 <link rel="stylesheet" href="/public/style.css">
+<link rel="stylesheet" href="/public/pptx-viewer.css">
 </head>
 <body>
 <div id="control-container">
-  <!-- Password screen -->
+  <!-- 密码锁 -->
   <div id="password-screen">
-    <h2>控制面板</h2>
+    <h2>🔑 控制面板</h2>
     <p class="hint">请输入访问密码</p>
     <input type="password" id="password-input" placeholder="密码" maxlength="20">
     <button id="password-btn">解锁</button>
     <p id="password-error" class="error" style="display:none">密码错误</p>
   </div>
 
-  <!-- Control panel -->
+  <!-- 控制面板 -->
   <div id="control-panel" style="display:none">
     <div id="status-bar">
       <span id="status-text">⏳ 等待连接...</span>
-      <span id="url-display" class="url-display"></span>
+      <span id="mode-indicator" style="margin-left:12px;font-size:12px;color:#888">模式: 浏览</span>
     </div>
 
-    <div id="keyboard">
+    <!-- 模式切换 -->
+    <div id="mode-switcher">
+      <button class="mode-btn" data-mode="browse">🌐 浏览</button>
+      <button class="mode-btn active" data-mode="ppt">📊 PPT</button>
+    </div>
+
+    <!-- 浏览模式键盘 -->
+    <div id="browse-keyboard" style="display:none">
       <div class="keyboard-row top">
         <button class="key" data-key="ArrowUp">↑</button>
       </div>
@@ -36,8 +44,28 @@
       <div class="keyboard-row bottom">
         <button class="key" data-key="ArrowDown">↓</button>
       </div>
+      <p class="hint" style="margin-top:12px;font-size:12px;">浏览模式下键盘事件会透传到展示页面</p>
     </div>
 
+    <!-- PPT 模式键盘 -->
+    <div id="ppt-keyboard">
+      <div class="pptx-control-keyboard">
+        <div class="key-label">上一页</div>
+        <div class="key-row">
+          <button class="nav-key" data-key="ArrowUp" data-action="prev">↑</button>
+          <button class="nav-key" data-key="ArrowLeft" data-action="prev">←</button>
+        </div>
+        <div style="margin:4px 0;color:#555;font-size:13px;">翻页控制</div>
+        <div class="key-row">
+          <button class="nav-key" data-key="ArrowDown" data-action="next">↓</button>
+          <button class="nav-key" data-key="ArrowRight" data-action="next">→</button>
+          <button class="nav-key space-key" style="width:100px;font-size:14px;" data-key=" " data-action="next">␣ 下一页</button>
+        </div>
+        <div class="key-label">下一页</div>
+      </div>
+    </div>
+
+    <!-- 密码修改 -->
     <div id="password-change-area">
       <button id="change-pw-btn">修改密码</button>
     </div>
@@ -52,7 +80,11 @@
 
 <script>
 (function() {
-  // --- Password (persisted in localStorage, never expires) ---
+  'use strict';
+
+  /* ============================================================
+     密码
+     ============================================================ */
   const LS_KEY = 'remote_control_password';
 
   function loadPassword() {
@@ -65,13 +97,17 @@
 
   let currentPassword = loadPassword();
 
-  // --- Session ID ---
+  /* ============================================================
+     Session
+     ============================================================ */
   function getSessionId() {
     const params = new URLSearchParams(location.search);
     return params.get('session') || 'default';
   }
 
-  // --- WebSocket ---
+  /* ============================================================
+     WebSocket
+     ============================================================ */
   let ws = null;
   let connected = false;
 
@@ -109,7 +145,24 @@
     }
   }
 
-  // --- Password ---
+  /* ============================================================
+     模式切换
+     ============================================================ */
+  let currentMode = 'ppt'; // 'browse' | 'ppt'
+
+  function setMode(mode) {
+    currentMode = mode;
+    document.querySelectorAll('.mode-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.mode === mode);
+    });
+    document.getElementById('browse-keyboard').style.display = mode === 'browse' ? 'block' : 'none';
+    document.getElementById('ppt-keyboard').style.display = mode === 'ppt' ? 'block' : 'none';
+    document.getElementById('mode-indicator').textContent = '模式: ' + (mode === 'browse' ? '浏览' : 'PPT');
+  }
+
+  /* ============================================================
+     密码
+     ============================================================ */
   const passwordInput = document.getElementById('password-input');
   const passwordBtn = document.getElementById('password-btn');
   const passwordError = document.getElementById('password-error');
@@ -119,14 +172,11 @@
   function unlock() {
     passwordScreen.style.display = 'none';
     controlPanel.style.display = 'block';
+    setMode(currentMode);
     connectWs();
   }
 
-  // Auto-unlock if a saved password exists (just show the panel directly)
-  // We still need the user to click if they want to see/enter a password
-  // But if localStorage has a password, we skip the screen entirely
   if (localStorage.getItem(LS_KEY)) {
-    currentPassword = loadPassword();
     unlock();
   }
 
@@ -144,61 +194,70 @@
     if (e.key === 'Enter') passwordBtn.click();
   });
 
-  // --- Keyboard events ---
-  // Click / touch on virtual keys
-  document.querySelectorAll('.key').forEach(btn => {
-    const key = btn.dataset.key;
+  /* ============================================================
+     模式切换按钮
+     ============================================================ */
+  document.querySelectorAll('.mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => setMode(btn.dataset.mode));
+  });
 
-    let pressFired = false;  // prevent mouse events after touch
+  /* ============================================================
+     键盘事件
+     ============================================================ */
+
+  // 虚拟按键（浏览模式和 PPT 模式共用）
+  document.querySelectorAll('.key, .nav-key').forEach(btn => {
+    const key = btn.dataset.key;
+    let pressFired = false;
 
     const press = (e) => {
       e.preventDefault();
+      // PPT 模式下翻页只发 keydown，不发 keyup，避免展示端翻两页
+      if (currentMode === 'ppt') {
+        sendKey(key, 'keydown');
+        btn.classList.add('active');
+        return;
+      }
       sendKey(key, 'keydown');
       btn.classList.add('active');
     };
 
     const release = (e) => {
       e.preventDefault();
+      // PPT 模式跳过 keyup，已在 press 完成
+      if (currentMode === 'ppt') {
+        btn.classList.remove('active');
+        return;
+      }
       sendKey(key, 'keyup');
       btn.classList.remove('active');
-    };
-
-    const touchStart = (e) => {
-      pressFired = true;
-      press(e);
-    };
-
-    const touchEnd = (e) => {
-      release(e);
-    };
-
-    const touchCancel = (e) => {
-      release(e);
     };
 
     btn.addEventListener('mousedown', (e) => {
       if (pressFired) { pressFired = false; return; }
       press(e);
     });
-    btn.addEventListener('mouseup', (e) => {
-      if (pressFired) { pressFired = false; return; }
-      release(e);
-    });
-    btn.addEventListener('mouseleave', (e) => {
-      if (pressFired) { pressFired = false; return; }
-      release(e);
-    });
-    btn.addEventListener('touchstart', touchStart, { passive: false });
-    btn.addEventListener('touchend', touchEnd, { passive: false });
-    btn.addEventListener('touchcancel', touchCancel, { passive: false });
+    btn.addEventListener('mouseup', release);
+    btn.addEventListener('mouseleave', release);
+    btn.addEventListener('touchstart', (e) => {
+      pressFired = true;
+      press(e);
+    }, { passive: false });
+    btn.addEventListener('touchend', release, { passive: false });
+    btn.addEventListener('touchcancel', release, { passive: false });
   });
 
-  // Physical keyboard passthrough (for testing)
+  // 物理键盘
   document.addEventListener('keydown', (e) => {
     const valid = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '];
     if (valid.includes(e.key)) {
       e.preventDefault();
-      sendKey(e.key, 'keydown');
+      if (currentMode === 'ppt') {
+        // PPT 模式只发 keydown，避免翻两页
+        sendKey(e.key, 'keydown');
+      } else {
+        sendKey(e.key, 'keydown');
+      }
     }
   });
 
@@ -206,11 +265,16 @@
     const valid = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', ' '];
     if (valid.includes(e.key)) {
       e.preventDefault();
-      sendKey(e.key, 'keyup');
+      // PPT 模式跳过 keyup
+      if (currentMode !== 'ppt') {
+        sendKey(e.key, 'keyup');
+      }
     }
   });
 
-  // --- Password change ---
+  /* ============================================================
+     密码修改
+     ============================================================ */
   const changePwBtn = document.getElementById('change-pw-btn');
   const changePwForm = document.getElementById('password-change-form');
   const oldPwInput = document.getElementById('old-pw');
